@@ -1,0 +1,245 @@
+version: '3.8'
+
+# Rails Stack (PostgreSQL, Redis, Sidekiq)
+# Production-ready configuration with security hardening, health checks, and monitoring
+
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - public_files:/app/public:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - rails
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - frontend
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+
+  rails:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    expose:
+      - "3000"
+    environment:
+      - RAILS_ENV=production
+      - DATABASE_URL=postgresql://${DB_USER:-rails}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-rails_production}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY_BASE_FILE=/run/secrets/secret_key_base
+      - RAILS_LOG_TO_STDOUT=true
+      - RAILS_SERVE_STATIC_FILES=true
+    volumes:
+      - ./app:/app:ro
+      - public_files:/app/public
+      - rails_logs:/app/log
+      - rails_tmp:/app/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - frontend
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - secret_key_base
+    command: ["bundle", "exec", "puma", "-C", "config/puma.rb"]
+
+  sidekiq:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    environment:
+      - RAILS_ENV=production
+      - DATABASE_URL=postgresql://${DB_USER:-rails}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-rails_production}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY_BASE_FILE=/run/secrets/secret_key_base
+    volumes:
+      - ./app:/app:ro
+      - rails_logs:/app/log
+      - rails_tmp:/app/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rails:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - secret_key_base
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-rails}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_DB: ${DB_NAME:-rails_production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - postgres_logs:/var/log/postgresql
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-rails}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - db_password
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    command: redis-server /usr/local/etc/redis/redis.conf
+
+  # PostgreSQL backup service
+  pg-backup:
+    image: postgres:16-alpine
+    volumes:
+      - postgres_backups:/backups
+      - ./backup/backup.sh:/backup.sh:ro
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=${DB_USER:-rails}
+      - PGPASSWORD_FILE=/run/secrets/db_password
+      - PGDATABASE=${DB_NAME:-rails_production}
+      - BACKUP_DIR=/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - db_password
+    command: ["sh", "-c", "while true; do sleep 86400; sh /backup.sh; done"]
+
+  # Prometheus monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - monitoring
+    security_opt:
+      - no-new-privileges:true
+
+  # Grafana dashboards
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_password
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - monitoring
+    security_opt:
+      - no-new-privileges:true
+    secrets:
+      - grafana_password
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+  monitoring:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  postgres_backups:
+    driver: local
+  postgres_logs:
+    driver: local
+  redis_data:
+    driver: local
+  public_files:
+    driver: local
+  rails_logs:
+    driver: local
+  rails_tmp:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  nginx_logs:
+    driver: local
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  secret_key_base:
+    file: ./secrets/secret_key_base.txt
+  grafana_password:
+    file: ./secrets/grafana_password.txt
